@@ -33,36 +33,36 @@ When hyper-growth platforms (like **Stripe**, **Razorpay**, or **GitHub**) dispa
 
 ```mermaid
 flowchart TD
-    subgraph Producers ["1. Event Ingestion Layer"]
-        P1["Payment Gateway\n(e.g., Stripe/Razorpay)"] -->|POST /api/v1/webhooks/ingest| API["FastAPI Ingestion Engine"]
-        P2["E-Commerce Core"] -->|Idempotency Key + Seq ID| API
+    subgraph Ingestion ["1. Event Ingestion Layer"]
+        P1["Payment Gateway<br/>(Stripe, Razorpay)"] -->|"POST /api/v1/webhooks/ingest"| API["FastAPI Ingestion Engine"]
+        P2["Internal Event Core"] -->|"Idempotency Key + Seq ID"| API
     end
 
     subgraph Persistence ["2. Durable Database Layer"]
-        API -->|INSERT state=PENDING| DB[("PostgreSQL\n(webhook_events table)")]
-        DB -->|Unique Index (id)| IDEMP["Strict Idempotency Guard\n(Duplicate Deduplication)"]
+        API -->|"INSERT state=PENDING"| DB[("PostgreSQL DB<br/>webhook_events")]
+        DB -->|"Unique Idempotency Index"| IDEMP["Idempotency Guard<br/>Deduplication Engine"]
     end
 
     subgraph MessageBroker ["3. Async Message Broker"]
-        API -->|deliver_webhook.delay(event_id)| REDIS["Redis Message Broker\n(Task Queue)"]
+        API -->|"deliver_webhook.delay"| REDIS["Redis Message Broker<br/>Task Queue"]
     end
 
     subgraph Workers ["4. Resilient Worker Fleet"]
-        REDIS --> WORKER["Celery Worker Pool\n(acks_late=True, prefetch=1)"]
-        WORKER -->|HMAC-SHA256 Sign| SIGN["X-Signature-SHA256\nGenerator"]
-        WORKER -->|Non-blocking HTTPX (3s limit)| TARGET["Client Webhook Endpoint"]
+        REDIS --> WORKER["Celery Worker Pool<br/>acks_late=True, prefetch=1"]
+        WORKER -->|"HMAC-SHA256 Sign"| SIGN["X-Signature-SHA256<br/>Generator"]
+        WORKER -->|"HTTPX POST (timeout=3s)"| TARGET["Client Webhook Endpoint"]
     end
 
     subgraph CircuitBreaker ["5. Circuit Breaker Engine"]
-        WORKER -->|Record Status| CB["Circuit Breaker State Machine"]
-        CB -->|100 consecutive 5xx| PAUSE["Client State = PAUSED\n(Bypass to DLQ)"]
-        CB -->|Timeout Expired| PROBE["Half-Open Probe Traffic"]
+        WORKER -->|"Record Delivery Status"| CB["Circuit Breaker State Machine"]
+        CB -->|"100 consecutive 5xx"| PAUSE["Client State = PAUSED<br/>Bypass to DLQ"]
+        CB -->|"Timeout Expired"| PROBE["Half-Open Probe Traffic"]
     end
 
     subgraph FailureHandling ["6. Dead Letter Queue & Retry"]
-        WORKER -->|Retry (Full Jitter)| REDIS
-        WORKER -->|5 Retries Exhausted| DLQ[("Dead Letter Queue (DLQ)\nPostgreSQL Table")]
-        ADMIN["Admin REST API"] -->|Staggered Bulk Replay| REDIS
+        WORKER -->|"Retry (Full Jitter)"| REDIS
+        WORKER -->|"5 Retries Exhausted"| DLQ[("Dead Letter Queue<br/>PostgreSQL DLQ")]
+        ADMIN["Admin REST API"] -->|"Staggered Bulk Replay"| REDIS
     end
 ```
 
@@ -74,8 +74,12 @@ flowchart TD
 
 Standard exponential backoff clusters retries. Equal jitter helps but still biases retries toward the tail of each window. **EventPulse implements AWS-recommended Full Jitter**:
 
-$$\text{MaxInterval} = \min\left(\text{Cap}, 2^{\text{retry\_count}}\right)$$
-$$\text{Delay} = \text{random.uniform}\left(0.1, \text{MaxInterval}\right)$$
+```math
+\text{MaxInterval} = \min(\text{Cap}, 2^{\text{retry}})
+```
+```math
+\text{Delay} = \text{random}(0.1, \text{MaxInterval})
+```
 
 | Retry # | Window | Standard Exp Backoff | Equal Jitter | EventPulse Full Jitter |
 |:---:|:---:|:---:|:---:|:---:|
@@ -90,7 +94,11 @@ $$\text{Delay} = \text{random.uniform}\left(0.1, \text{MaxInterval}\right)$$
 
 ### 2. Cryptographic Authenticity (HMAC-SHA256)
 Every outbound payload is signed with the client's secret key:
-$$\text{Signature} = \text{HMAC-SHA256}\left(\text{DeterministicJSON}(\text{payload}), \text{client\_secret}\right)$$
+
+```math
+\text{Signature} = \text{HMAC-SHA256}(\text{CanonicalPayload}, \text{ClientSecret})
+```
+
 - **Constant-Time Verification**: `hmac.compare_digest` prevents timing attacks.
 - **Key Invariance**: Payloads are formatted with sorted keys (`sort_keys=True`) ensuring identical digests regardless of field ordering.
 
@@ -137,7 +145,11 @@ EventPulse follows the **Stripe & GitHub Industry Pattern**:
 When an incident is resolved on the recipient's side, replaying 5,000 failed webhooks simultaneously would immediately re-trigger a thundering herd. 
 
 EventPulse provides **Rate-Staggered Bulk Replay**:
-$$\text{StaggerInterval} = \frac{\text{SpreadWindowSeconds}}{\text{TotalEvents}}$$
+
+```math
+\text{StaggerInterval} = \frac{\text{SpreadWindowSeconds}}{\text{TotalEvents}}
+```
+
 Tasks are scheduled across Redis using delayed countdowns (`countdown = i * stagger`), smoothly throttling re-delivery.
 
 ---
@@ -289,7 +301,7 @@ eventpulse_unreplayed_dlq_gauge 3
 <details>
 <summary><b>Q3: Why Full Jitter instead of Exponential Backoff with Equal Jitter?</b></summary>
 
-> **Answer:** Equal Jitter guarantees that half the delay is deterministic: $\frac{\text{Delay}}{2} + \text{random}\left(0, \frac{\text{Delay}}{2}\right)$. When thousands of clients fail simultaneously, Equal Jitter still clusters retries into the latter 50% of the window. Full Jitter uniformly redistributes across $[0, \text{MaxInterval}]$, which empirical AWS load testing proves generates the smoothest client recovery curve.
+> **Answer:** Equal Jitter guarantees that half the delay is deterministic: $\frac{\text{Delay}}{2} + \text{random}(0, \frac{\text{Delay}}{2})$. When thousands of clients fail simultaneously, Equal Jitter still clusters retries into the latter 50% of the window. Full Jitter uniformly redistributes across $[0, \text{MaxInterval}]$, which empirical AWS load testing proves generates the smoothest client recovery curve.
 </details>
 
 <details>

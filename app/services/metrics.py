@@ -103,3 +103,4 @@ class MetricsCollector:
 
 # Global singleton instance
 metrics_collector = MetricsCollector()
+
