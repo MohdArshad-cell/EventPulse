@@ -12,6 +12,17 @@ async def test_health_check(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_prometheus_metrics_endpoint(client: AsyncClient):
+    response = await client.get("/metrics")
+    assert response.status_code == 200
+    assert "text/plain" in response.headers["content-type"]
+    text = response.text
+    assert "eventpulse_events_ingested_total" in text
+    assert "eventpulse_pending_events_gauge" in text
+    assert "eventpulse_unreplayed_dlq_gauge" in text
+
+
+@pytest.mark.asyncio
 async def test_ingest_webhook_new_and_idempotency(client: AsyncClient):
     payload = {
         "event_id": "test_evt_1001",
@@ -71,4 +82,3 @@ async def test_client_crud_and_subscriptions(client: AsyncClient):
     assert update_res.status_code == 200
     assert len(update_res.json()["subscriptions"]) == 1
     assert update_res.json()["subscriptions"][0]["event_type"] == "order.*"
-

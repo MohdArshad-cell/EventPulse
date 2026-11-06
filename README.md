@@ -1,284 +1,304 @@
-# 🚀 EventPulse — Resilient Webhook Dispatcher System
+<div align="center">
 
-A production-grade, highly resilient webhook dispatching and retry system built with **Python 3.10+, FastAPI, Celery, Redis, and PostgreSQL / SQLAlchemy 2.0 (Async)**.
+# ⚡ EventPulse
+### Resilient, Distributed Webhook Dispatcher System
+**Zero Event Loss • Thundering Herd Immunity • Cryptographic HMAC • Per-Client Circuit Breaking**
+
+[![CI/CD Pipeline](https://github.com/MohdArshad-cell/EventPulse/actions/workflows/ci.yml/badge.svg)](https://github.com/MohdArshad-cell/EventPulse/actions/workflows/ci.yml)
+[![Python Version](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![Celery](https://img.shields.io/badge/Celery-5.4+-37814A.svg?logo=celery&logoColor=white)](https://docs.celeryq.dev/)
+[![Redis](https://img.shields.io/badge/Redis-7.0+-DC382D.svg?logo=redis&logoColor=white)](https://redis.io/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16+-4169E1.svg?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![SQLAlchemy 2.0](https://img.shields.io/badge/SQLAlchemy-2.0%20Async-D71E00.svg)](https://docs.sqlalchemy.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ---
 
-## 📌 The Real-World Problem Solved
+</div>
 
-When platforms like Stripe, Razorpay, or GitHub broadcast webhooks to external recipient servers:
-1. **Recipient Flakiness**: External webhooks frequently experience network blips, 500 server crashes, or slow responses.
-2. **Thread Pool Exhaustion**: Synchronous webhook delivery locks worker processes, rapidly exhausting thread pools and causing downstream cascading service failures.
-3. **Thundering Herd On Retries**: If 10,000 webhooks fail for a client simultaneously, retrying them at deterministic exponential intervals hits the recovering server with 10,000 concurrent requests at the exact same millisecond, crashing it again.
-4. **Out-of-Order Delivery**: If `order.created` fails and goes into retry while `order.cancelled` succeeds immediately, downstream systems process events out of sequence.
+## 📌 The Real-World Engineering Problem
+
+When hyper-growth platforms (like **Stripe**, **Razorpay**, or **GitHub**) dispatch webhook events to external consumer systems, they encounter hostile real-world network conditions:
+
+1. **Thread Pool Starvation**: Sending webhooks synchronously blocks application workers. If consumer endpoints respond slowly or hang, thread pools exhaust in seconds, causing total system outages.
+2. **Permanent Event Loss**: Without persistent queuing and transaction boundaries, failures during delivery permanently drop events.
+3. **The Thundering Herd Disaster**: If 10,000 webhooks fail during client downtime, retrying them with standard exponential intervals (`2^n`) clusters all 10,000 requests into the exact same millisecond window, repeatedly crashing the recovering server.
+4. **Out-of-Order Execution**: If `order.created` fails and goes into retry while `order.cancelled` succeeds immediately, downstream subscriber applications corrupt their internal state.
+5. **Cascading Server Overload**: When an external client server completely dies, continuously hammering it with doomed deliveries wastes network bandwidth and broker resources.
 
 ---
 
-## 🏗️ Core Architecture & Blueprint
+## 🏛️ System Architecture
 
 ```mermaid
-flowchart LR
-    subgraph Ingestion
-        A["Producer\n(Stripe/Razorpay/GitHub)"] -->|POST /api/v1/webhooks/ingest| B["FastAPI Ingestion Endpoint"]
+flowchart TD
+    subgraph Producers ["1. Event Ingestion Layer"]
+        P1["Payment Gateway\n(e.g., Stripe/Razorpay)"] -->|POST /api/v1/webhooks/ingest| API["FastAPI Ingestion Engine"]
+        P2["E-Commerce Core"] -->|Idempotency Key + Seq ID| API
     end
 
-    subgraph Persistence
-        B -->|INSERT state=PENDING| C[("PostgreSQL\nwebhook_events")]
+    subgraph Persistence ["2. Durable Database Layer"]
+        API -->|INSERT state=PENDING| DB[("PostgreSQL\n(webhook_events table)")]
+        DB -->|Unique Index (id)| IDEMP["Strict Idempotency Guard\n(Duplicate Deduplication)"]
     end
 
-    subgraph Queuing
-        B -->|deliver_webhook.delay| D["Redis Message Broker"]
+    subgraph MessageBroker ["3. Async Message Broker"]
+        API -->|deliver_webhook.delay(event_id)| REDIS["Redis Message Broker\n(Task Queue)"]
     end
 
-    subgraph Workers
-        D --> E["Celery Worker Pool"]
-        E -->|"HTTPX POST (timeout=3s)\n+ X-Signature-SHA256"| F["Client Webhook Endpoint"]
+    subgraph Workers ["4. Resilient Worker Fleet"]
+        REDIS --> WORKER["Celery Worker Pool\n(acks_late=True, prefetch=1)"]
+        WORKER -->|HMAC-SHA256 Sign| SIGN["X-Signature-SHA256\nGenerator"]
+        WORKER -->|Non-blocking HTTPX (3s limit)| TARGET["Client Webhook Endpoint"]
     end
 
-    subgraph Failure
-        E -->|"Retry (Exp Backoff + Full Jitter)"| D
-        E -->|"Max 5 retries exceeded"| G[("PostgreSQL\nDead Letter Queue (DLQ)")]
+    subgraph CircuitBreaker ["5. Circuit Breaker Engine"]
+        WORKER -->|Record Status| CB["Circuit Breaker State Machine"]
+        CB -->|100 consecutive 5xx| PAUSE["Client State = PAUSED\n(Bypass to DLQ)"]
+        CB -->|Timeout Expired| PROBE["Half-Open Probe Traffic"]
     end
 
-    subgraph CircuitBreaker
-        E -->|">= 100 consecutive 500s"| H["Client State = PAUSED\n(Circuit Breaker Trip)"]
-    end
-
-    subgraph Admin
-        I["Admin API"] -->|"Replay / Staggered Bulk Replay"| D
-        I -->|"Query & Audit"| C
-        I -->|"Query & Audit"| G
+    subgraph FailureHandling ["6. Dead Letter Queue & Retry"]
+        WORKER -->|Retry (Full Jitter)| REDIS
+        WORKER -->|5 Retries Exhausted| DLQ[("Dead Letter Queue (DLQ)\nPostgreSQL Table")]
+        ADMIN["Admin REST API"] -->|Staggered Bulk Replay| REDIS
     end
 ```
 
 ---
 
-## 🔑 Key Architectural Features
+## 🔬 Architectural Deep Dives & Edge Case Solutions
 
-### 1. Ingestion Pipeline & Idempotency
-- **Endpoint**: `POST /api/v1/webhooks/ingest`
-- Generates or accepts a unique `event_id` (idempotency key).
-- Persists event to `webhook_events` with initial state `PENDING`.
-- If an event with the same `event_id` is re-submitted, returns `200 OK` (`ALREADY_PROCESSED`) without duplicating delivery.
-- Asynchronously triggers Celery worker via Redis message broker.
+### 1. Thundering Herd Mitigation: Full Jitter Algorithm
+
+Standard exponential backoff clusters retries. Equal jitter helps but still biases retries toward the tail of each window. **EventPulse implements AWS-recommended Full Jitter**:
+
+$$\text{MaxInterval} = \min\left(\text{Cap}, 2^{\text{retry\_count}}\right)$$
+$$\text{Delay} = \text{random.uniform}\left(0.1, \text{MaxInterval}\right)$$
+
+| Retry # | Window | Standard Exp Backoff | Equal Jitter | EventPulse Full Jitter |
+|:---:|:---:|:---:|:---:|:---:|
+| 1 | 0.1s – 2.0s | Exactly 2.0s *(herd spikes)* | 1.0s – 2.0s | **0.1s – 2.0s (Uniform Spread)** |
+| 2 | 0.1s – 4.0s | Exactly 4.0s *(herd spikes)* | 2.0s – 4.0s | **0.1s – 4.0s (Uniform Spread)** |
+| 3 | 0.1s – 8.0s | Exactly 8.0s *(herd spikes)* | 4.0s – 8.0s | **0.1s – 8.0s (Uniform Spread)** |
+| 4 | 0.1s – 16.0s | Exactly 16.0s *(herd spikes)* | 8.0s – 16.0s | **0.1s – 16.0s (Uniform Spread)** |
+| 5 | 0.1s – 32.0s | Exactly 32.0s *(herd spikes)* | 16.0s – 32.0s | **0.1s – 32.0s (Uniform Spread)** |
+| > 5 | — | — | — | **Moved to DLQ** |
+
+---
 
 ### 2. Cryptographic Authenticity (HMAC-SHA256)
-- Every outbound webhook attaches the header:
-  ```http
-  X-Signature-SHA256: <hex_digest>
-  ```
-- Generated via:
-  $$\text{Signature} = \text{HMAC-SHA256}(\text{canonical\_payload}, \text{client\_secret})$$
-- Serializes JSON with sorted keys to ensure deterministic signatures.
-- Uses constant-time comparison (`hmac.compare_digest`) to prevent timing attacks.
+Every outbound payload is signed with the client's secret key:
+$$\text{Signature} = \text{HMAC-SHA256}\left(\text{DeterministicJSON}(\text{payload}), \text{client\_secret}\right)$$
+- **Constant-Time Verification**: `hmac.compare_digest` prevents timing attacks.
+- **Key Invariance**: Payloads are formatted with sorted keys (`sort_keys=True`) ensuring identical digests regardless of field ordering.
 
-### 3. Exponential Backoff with Full Jitter
-To solve the **Thundering Herd Problem**, retries are uniformly randomized across the exponential window:
-$$\text{Delay} = \text{random.uniform}(0.1, \min(\text{cap}, 2^{\text{retry\_count}}))$$
-- **Cap**: 300 seconds (5 minutes).
-- **Max Retries**: 5.
-- If 10,000 webhooks fail simultaneously, retries are smoothly smeared across the timeline rather than spiking at fixed intervals.
-
-### 4. Per-Client Auto Circuit Breaker
-- Tracks consecutive failures per client.
-- When `consecutive_failures >= 100`, the client is set to `PAUSED` state with `paused_until = now + 10 minutes`.
-- Further events for that client immediately route to the DLQ (`CIRCUIT_BREAKER_OPEN`), protecting the external server from being overwhelmed.
-- Periodic probe (Half-Open) attempts delivery when `paused_until` expires. If the probe succeeds, the client auto-resumes `ACTIVE`.
-- Manual override: `POST /api/v1/clients/{id}/resume`.
-
-### 5. Out-of-Order Delivery & Sequence IDs
-- Dispatching strictly in FIFO per-client hurts throughput.
-- EventPulse attaches `X-Sequence-Id: <monotonic_id>` to all payloads and headers (same pattern as Stripe and GitHub).
-- Receivers can buffer out-of-order events or fetch missing events if sequence gaps are observed.
-
-### 6. Dead Letter Queue (DLQ) & Staggered Bulk Replay
-- Events that exhaust 5 retries move to the `dead_letter_queue` table in PostgreSQL.
-- **Admin API**:
-  - `GET /api/v1/admin/dlq`: Filterable by `client_id`, `event_type`, date range, and `replayed` status.
-  - `POST /api/v1/admin/dlq/{id}/replay`: Replay a single failed event.
-  - `POST /api/v1/admin/dlq/bulk-replay`: Bulk replays failed events **with staggered delays** across a specified time window (`spread_window_seconds`), preventing re-triggering the thundering herd.
-
-### 7. Event Filtering & Wildcard Subscriptions
-- Clients subscribe to specific events:
-  - Exact match: `"payment.success"`
-  - Prefix wildcard: `"payment.*"` (matches `"payment.created"`, `"payment.refunded"`)
-  - Universal wildcard: `"*"` (receives all events)
-
----
-
-## 📁 Project Layout
-
-```
-EventPulse/
-├── app/
-│   ├── api/
-│   │   ├── v1/
-│   │   │   ├── admin.py            # DLQ listing, replay, audit
-│   │   │   ├── clients.py          # Client & subscription management
-│   │   │   ├── health.py           # DB & Redis connectivity health check
-│   │   │   ├── ingest.py           # POST /webhooks/ingest
-│   │   │   └── router.py           # Aggregated v1 routes
-│   │   ├── deps.py                 # DB session & API key security
-│   │   └── router.py
-│   ├── db/
-│   │   └── session.py              # Async SQLAlchemy engine & sessionmaker
-│   ├── models/
-│   │   ├── base.py                 # DeclarativeBase & UUID generator
-│   │   ├── client.py               # Client model with circuit breaker state
-│   │   ├── dead_letter.py          # DLQ model
-│   │   ├── delivery_attempt.py     # Attempt audit log with timing
-│   │   ├── subscription.py         # Client event subscriptions
-│   │   └── webhook_event.py        # WebhookEvent with sequence_id & state
-│   ├── schemas/                    # Pydantic v2 schemas
-│   ├── services/
-│   │   ├── circuit_breaker.py      # Circuit breaker state machine
-│   │   ├── ingestion.py            # Idempotent ingestion pipeline
-│   │   ├── replay.py               # Staggered DLQ replay engine
-│   │   └── signature.py            # HMAC-SHA256 signer & verifier
-│   ├── worker/
-│   │   ├── celery_app.py           # Celery configuration
-│   │   ├── retry.py                # Full Jitter backoff algorithm
-│   │   └── tasks.py                # Async HTTPX delivery & Celery tasks
-│   ├── config.py                   # Pydantic Settings
-│   └── main.py                     # FastAPI application factory & lifespan
-├── scripts/
-│   ├── seed_clients.py             # Seed demo clients
-│   └── simulate_failures.py        # Test failure & DLQ simulation
-├── tests/                          # 17 automated unit and integration tests
-├── Dockerfile
-├── docker-compose.yml
-├── pyproject.toml
-├── requirements.txt
-├── IMPLEMENTATION_PLAN.md
-└── README.md
+Attached headers:
+```http
+POST /webhook HTTP/1.1
+Host: client.api.com
+Content-Type: application/json
+X-Event-Id: 0192e4ab-3012-78d1-b541-fa7289028a1c
+X-Event-Type: payment.success
+X-Signature-SHA256: 3a28f8045b6db763e1f0e210dc41144f8f30c6a992688463c6cfce797f1f9172
+X-Sequence-Id: 48912
 ```
 
 ---
 
-## ⚡ Quick Start Guide
+### 3. Per-Client Circuit Breaker State Machine
 
-### 1. Local Setup with Virtualenv
+```mermaid
+stateDiagram-v2
+    [*] --> ACTIVE: Client Registered
+    ACTIVE --> PAUSED: consecutive_failures >= 100
+    PAUSED --> HALF_OPEN: paused_until timer expired (10m)
+    HALF_OPEN --> ACTIVE: Probe delivery returns HTTP 2xx
+    HALF_OPEN --> PAUSED: Probe delivery fails (extend backoff)
+    PAUSED --> ACTIVE: Manual Admin Override (POST /resume)
+```
+
+- **Fail-Fast DLQ Routing**: While in `PAUSED` state, newly ingested events bypass network calls and land directly in the DLQ with reason `CIRCUIT_BREAKER_OPEN`.
+- **Half-Open Probes**: When the pause timeout elapses, the client allows a test delivery probe to verify endpoint recovery without overwhelming it.
+
+---
+
+### 4. Out-of-Order Delivery: Sequence IDs
+Enforcing strictly ordered FIFO queues per customer creates head-of-line blocking that ruins throughput. 
+EventPulse follows the **Stripe & GitHub Industry Pattern**:
+- Every event includes a monotonic `sequence_id`.
+- If client receives event `sequence_id=5` before `sequence_id=4`, client buffers the event or fetches the missing event via the audit API.
+
+---
+
+### 5. Dead Letter Queue & Staggered Bulk Replay
+
+When an incident is resolved on the recipient's side, replaying 5,000 failed webhooks simultaneously would immediately re-trigger a thundering herd. 
+
+EventPulse provides **Rate-Staggered Bulk Replay**:
+$$\text{StaggerInterval} = \frac{\text{SpreadWindowSeconds}}{\text{TotalEvents}}$$
+Tasks are scheduled across Redis using delayed countdowns (`countdown = i * stagger`), smoothly throttling re-delivery.
+
+---
+
+## 🚀 Quickstart Guide
+
+### Option A: Local Development (SQLite & In-Memory Redis)
 
 ```bash
-# 1. Clone & create venv
-python -m venv .venv
-.\.venv\Scripts\activate
+# 1. Clone repository
+git clone https://github.com/MohdArshad-cell/EventPulse.git
+cd EventPulse
 
-# 2. Install dependencies
+# 2. Set up virtual environment
+python -m venv .venv
+.\.venv\Scripts\activate   # Windows
+# source .venv/bin/activate # Linux/macOS
+
+# 3. Install dependencies
 pip install -r requirements.txt
 
-# 3. Seed demo clients
+# 4. Seed demo clients with subscriptions
 python scripts/seed_clients.py
 
-# 4. Run automated tests (17 passed)
+# 5. Run the full test suite (18 tests)
 python -m pytest -v
 
-# 5. Run failure & retry simulation
-python scripts/simulate_failures.py
-
-# 6. Start FastAPI server
+# 6. Start the API server
 uvicorn app.main:app --reload --port 8000
 ```
 
-### 2. Docker Compose (Full Stack)
-
-To run FastAPI, PostgreSQL, Redis, Celery Worker, and Celery Beat together:
+### Option B: Production Docker Compose (PostgreSQL 16 + Redis 7 + Celery)
 
 ```bash
 docker compose up -d --build
 ```
+Services deployed:
+- `api`: FastAPI on `http://localhost:8000`
+- `worker`: Celery worker fleet (`--concurrency=4`)
+- `beat`: Celery Beat periodic circuit breaker sweep
+- `postgres`: PostgreSQL 16 on `5432`
+- `redis`: Redis 7 on `6379`
 
 ---
 
-## 📡 API Reference & Examples
+## 🛠️ Interactive Tooling & Testing
 
-### Ingest a Webhook
+### 1. Interactive Mock Webhook Receiver CLI
+Test webhook delivery and cryptographic verification locally:
 ```bash
-POST /api/v1/webhooks/ingest
-Content-Type: application/json
+# Terminal 1: Start Mock Receiver listening on port 9000
+python scripts/mock_receiver.py --port 9000
 
-{
-  "event_id": "evt_9988223344",
-  "event_type": "payment.success",
-  "payload": {
-    "customer": "cust_1001",
-    "amount": 4999,
-    "currency": "USD"
-  },
-  "sequence_id": 104
-}
+# Terminal 2: Test simulating 500 crashes
+python scripts/mock_receiver.py --port 9000 --status 500
+
+# Terminal 3: Test simulating high network latency (4s timeout)
+python scripts/mock_receiver.py --port 9000 --delay 4.0
+```
+
+### 2. Failure & DLQ Load Simulator
+Watch retries, jitter delays, and DLQ movement in real-time:
+```bash
+python scripts/simulate_failures.py
+```
+
+---
+
+## 📡 REST API Reference
+
+| Method | Endpoint | Description | Auth |
+|:---:|---|---|:---:|
+| `POST` | `/api/v1/webhooks/ingest` | Idempotent webhook ingestion (`202 Accepted` / `200 OK`) | — |
+| `GET` | `/api/v1/admin/events/{id}` | Complete audit trail & delivery attempt timings | `X-Admin-Key` |
+| `GET` | `/api/v1/admin/dlq` | Query Dead Letter Queue (filtered by client/event/date) | `X-Admin-Key` |
+| `POST` | `/api/v1/admin/dlq/{id}/replay` | Replay a single failed event | `X-Admin-Key` |
+| `POST` | `/api/v1/admin/dlq/bulk-replay` | Staggered bulk replay across rate-limited time window | `X-Admin-Key` |
+| `POST` | `/api/v1/clients` | Register a new client & HMAC secret | `X-Admin-Key` |
+| `GET` | `/api/v1/clients` | List all subscribers & circuit breaker states | `X-Admin-Key` |
+| `PUT` | `/api/v1/clients/{id}/subscriptions` | Update subscribed event patterns (`payment.*`, `*`) | `X-Admin-Key` |
+| `POST` | `/api/v1/clients/{id}/resume` | Manual circuit breaker override (PAUSED -> ACTIVE) | `X-Admin-Key` |
+| `GET` | `/metrics` | Prometheus metrics scrape endpoint | Public |
+| `GET` | `/api/v1/health` | Comprehensive DB, Redis, and broker health check | Public |
+
+### Ingestion Example
+```bash
+curl -X POST "http://localhost:8000/api/v1/webhooks/ingest" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "event_id": "evt_live_998822",
+    "event_type": "payment.success",
+    "payload": {
+      "customer_id": "cust_901",
+      "amount": 7500,
+      "currency": "INR"
+    },
+    "sequence_id": 105
+  }'
 ```
 
 **Response (`202 Accepted`)**:
 ```json
 {
-  "event_id": "evt_9988223344",
+  "event_id": "evt_live_998822",
   "status": "ACCEPTED",
   "message": "Event accepted for delivery and queued."
 }
 ```
 
-### Register a Webhook Subscriber Client
-```bash
-POST /api/v1/clients
-X-Admin-Key: eventpulse_admin_secret_token
-Content-Type: application/json
+---
 
-{
-  "name": "Acme Corp Webhook Receiver",
-  "endpoint_url": "https://api.acme.com/webhooks",
-  "event_types": ["payment.*", "invoice.paid"]
-}
-```
+## 📊 Observability & Prometheus Metrics
 
-### Staggered Bulk Replay from DLQ
-```bash
-POST /api/v1/admin/dlq/bulk-replay
-X-Admin-Key: eventpulse_admin_secret_token
-Content-Type: application/json
+Scrape metrics on `/metrics`:
+```prometheus
+# HELP eventpulse_events_ingested_total Total webhook events received and queued
+# TYPE eventpulse_events_ingested_total counter
+eventpulse_events_ingested_total{event_type="payment.success"} 4210
 
-{
-  "filter": {
-    "event_type": "payment.success"
-  },
-  "spread_window_seconds": 60.0
-}
-```
+# HELP eventpulse_deliveries_success_total Total successful webhook deliveries (HTTP 2xx)
+# TYPE eventpulse_deliveries_success_total counter
+eventpulse_deliveries_success_total{client_id="c_1",event_type="payment.success"} 4180
 
-**Response (`200 OK`)**:
-```json
-{
-  "total_matching": 120,
-  "replayed_count": 120,
-  "spread_window_seconds": 60.0,
-  "stagger_interval_seconds": 0.5,
-  "message": "Successfully scheduled 120 DLQ events staggered across 60.0s."
-}
+# HELP eventpulse_circuit_breaker_trips_total Total times client circuit was tripped to PAUSED
+# TYPE eventpulse_circuit_breaker_trips_total counter
+eventpulse_circuit_breaker_trips_total{client_id="c_2"} 1
+
+# HELP eventpulse_unreplayed_dlq_gauge Total unreplayed events in Dead Letter Queue
+# TYPE eventpulse_unreplayed_dlq_gauge gauge
+eventpulse_unreplayed_dlq_gauge 3
 ```
 
 ---
 
-## 🧪 Test Suite Summary
+## 🎯 System Design Interview Q&A Cheatsheet
 
-Run all tests:
-```bash
-python -m pytest -v
-```
+<details>
+<summary><b>Q1: What happens if the worker process crashes midway through sending a request?</b></summary>
 
-17 automated tests verify every component:
-- ✅ `test_circuit_breaker_transitions`: Failure threshold tripping, PAUSED state, HALF-OPEN probe, and recovery.
-- ✅ `test_circuit_breaker_force_resume`: Admin manual reset override.
-- ✅ `test_successful_delivery_flow`: HTTPX async delivery, response timing, HMAC-SHA256 header validation.
-- ✅ `test_failure_retry_and_dlq_flow`: 500 error backoff, retry counting, and DLQ insertion upon reaching max retries.
-- ✅ `test_dlq_list_and_single_replay`: Single DLQ item replay and state reset to PENDING.
-- ✅ `test_dlq_bulk_replay_staggered`: Multi-item staggered replay rate limiting.
-- ✅ `test_health_check`: Database & broker health checks.
-- ✅ `test_ingest_webhook_new_and_idempotency`: Duplicate detection and idempotency guarantee.
-- ✅ `test_client_crud_and_subscriptions`: Registration, subscription filtering, and updates.
-- ✅ `test_calculate_full_jitter_delay_range`: Full Jitter variance and bounds.
-- ✅ `test_calculate_full_jitter_delay_cap`: Cap enforcement at 300s.
-- ✅ `test_generate_secret`: Cryptographic hex secret generation.
-- ✅ `test_compute_and_verify_signature_dict`: HMAC-SHA256 signing and tamper detection.
-- ✅ `test_signature_deterministic_key_ordering`: Key order invariance in JSON serialization.
-- ✅ `test_matches_subscription_*`: Wildcard matching (`*`, `payment.*`, exact).
+> **Answer:** EventPulse configures Celery with `task_acks_late=True` and `task_reject_on_worker_lost=True`. The message broker only receives acknowledgment **after** execution succeeds and DB state commits. If the worker crashes or is OOM-killed, the broker automatically redelivers the task to another healthy worker. The receiving client uses the unique `X-Event-Id` header to deduplicate.
+</details>
 
+<details>
+<summary><b>Q2: What happens if Redis completely dies?</b></summary>
+
+> **Answer:** Redis acts as an ephemeral transport broker, not the source of truth. Every event is durably committed to PostgreSQL `webhook_events` with `state=PENDING` before enqueueing. When Redis recovers, a periodic sweeper task polls for `PENDING` events older than 60s and re-enqueues them, ensuring zero data loss.
+</details>
+
+<details>
+<summary><b>Q3: Why Full Jitter instead of Exponential Backoff with Equal Jitter?</b></summary>
+
+> **Answer:** Equal Jitter guarantees that half the delay is deterministic: $\frac{\text{Delay}}{2} + \text{random}\left(0, \frac{\text{Delay}}{2}\right)$. When thousands of clients fail simultaneously, Equal Jitter still clusters retries into the latter 50% of the window. Full Jitter uniformly redistributes across $[0, \text{MaxInterval}]$, which empirical AWS load testing proves generates the smoothest client recovery curve.
+</details>
+
+<details>
+<summary><b>Q4: How do you prevent race conditions between concurrent workers delivering the same event?</b></summary>
+
+> **Answer:** Workers utilize PostgreSQL row-level locks via `SELECT ... FOR UPDATE SKIP LOCKED` during state transitions, ensuring that only one worker can acquire and transition an event from `PENDING` to `DELIVERING`.
+</details>
+
+---
+
+## 📜 License
+This project is open-source software licensed under the [MIT License](LICENSE).

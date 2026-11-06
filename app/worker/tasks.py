@@ -17,6 +17,7 @@ from app.models.delivery_attempt import DeliveryAttempt
 from app.models.dead_letter import DeadLetter
 from app.services.signature import compute_signature
 from app.services.circuit_breaker import CircuitBreakerService
+from app.services.metrics import metrics_collector
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,7 @@ async def _deliver_internal(event_id: str, session: AsyncSession) -> dict:
             session.add(dlq_entry)
             has_any_failure = True
             last_failure_reason = f"CIRCUIT_BREAKER_OPEN: {cb_status}"
+            metrics_collector.record_delivery_failure(client.id, event.event_type)
             continue
 
         # Compute HMAC-SHA256 signature
@@ -134,22 +136,29 @@ async def _deliver_internal(event_id: str, session: AsyncSession) -> dict:
 
                 if 200 <= response.status_code < 300:
                     CircuitBreakerService.record_success(client)
+                    metrics_collector.record_delivery_success(client.id, event.event_type)
                 else:
                     error_message = f"HTTP {response.status_code}: {response.text[:200]}"
-                    CircuitBreakerService.record_failure(client)
+                    if CircuitBreakerService.record_failure(client):
+                        metrics_collector.record_cb_trip(client.id)
+                    metrics_collector.record_delivery_failure(client.id, event.event_type)
                     has_any_failure = True
                     last_failure_reason = error_message
 
         except httpx.TimeoutException as exc:
             response_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
             error_message = f"Request timed out after {settings.DELIVERY_TIMEOUT_SECONDS}s: {str(exc)}"
-            CircuitBreakerService.record_failure(client)
+            if CircuitBreakerService.record_failure(client):
+                metrics_collector.record_cb_trip(client.id)
+            metrics_collector.record_delivery_failure(client.id, event.event_type)
             has_any_failure = True
             last_failure_reason = error_message
         except Exception as exc:
             response_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
             error_message = f"Network or connection error: {str(exc)}"
-            CircuitBreakerService.record_failure(client)
+            if CircuitBreakerService.record_failure(client):
+                metrics_collector.record_cb_trip(client.id)
+            metrics_collector.record_delivery_failure(client.id, event.event_type)
             has_any_failure = True
             last_failure_reason = error_message
 
