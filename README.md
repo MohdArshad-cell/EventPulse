@@ -284,33 +284,5 @@ eventpulse_unreplayed_dlq_gauge 3
 
 ---
 
-## 🎯 System Design Interview Q&A Cheatsheet
-
-<details>
-<summary><b>Q1: What happens if the worker process crashes midway through sending a request?</b></summary>
-
-> **Answer:** EventPulse configures Celery with `task_acks_late=True` and `task_reject_on_worker_lost=True`. The message broker only receives acknowledgment **after** execution succeeds and DB state commits. If the worker crashes or is OOM-killed, the broker automatically redelivers the task to another healthy worker. The receiving client uses the unique `X-Event-Id` header to deduplicate.
-</details>
-
-<details>
-<summary><b>Q2: What happens if Redis completely dies?</b></summary>
-
-> **Answer:** Redis acts as an ephemeral transport broker, not the source of truth. Every event is durably committed to PostgreSQL `webhook_events` with `state=PENDING` before enqueueing. When Redis recovers, a periodic sweeper task polls for `PENDING` events older than 60s and re-enqueues them, ensuring zero data loss.
-</details>
-
-<details>
-<summary><b>Q3: Why Full Jitter instead of Exponential Backoff with Equal Jitter?</b></summary>
-
-> **Answer:** Equal Jitter guarantees that half the delay is deterministic: $\frac{\text{Delay}}{2} + \text{random}(0, \frac{\text{Delay}}{2})$. When thousands of clients fail simultaneously, Equal Jitter still clusters retries into the latter 50% of the window. Full Jitter uniformly redistributes across $[0, \text{MaxInterval}]$, which empirical AWS load testing proves generates the smoothest client recovery curve.
-</details>
-
-<details>
-<summary><b>Q4: How do you prevent race conditions between concurrent workers delivering the same event?</b></summary>
-
-> **Answer:** Workers utilize PostgreSQL row-level locks via `SELECT ... FOR UPDATE SKIP LOCKED` during state transitions, ensuring that only one worker can acquire and transition an event from `PENDING` to `DELIVERING`.
-</details>
-
----
-
 ## 📜 License
 This project is open-source software licensed under the [MIT License](LICENSE).

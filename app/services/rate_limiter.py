@@ -51,3 +51,4 @@ class TokenBucketRateLimiter:
 
 # Global rate limiter instance
 client_rate_limiter = TokenBucketRateLimiter(default_rate=50.0, default_capacity=50.0)
+
